@@ -13,12 +13,42 @@ What it does:
      Admin REST API (paginated via the Link header).
    - Keeps only line items belonging to orders whose financial_status
      is paid, partially_paid, or pending.
+   - Looks up Item Cost per SKU from Airtable's French Inventories table
+     (batched, not one request per line item).
    - Builds a styled .xlsx with columns:
-     Name, Created at, Fulfilled at, Lineitem name, Lineitem sku,
-     Lineitem price, Lineitem quantity, Shipping, Taxes, Discount
+     Name, Payment Status, Created at, Fulfilled at, Lineitem name,
+     Lineitem sku, Lineitem price, Lineitem quantity, Shipping, Taxes,
+     Discount, Total, Item Cost, Total Cost
+     — where Total = (price * qty) + Shipping - Discount, and
+       Total Cost = Item Cost * qty, both as LIVE Excel formulas.
    - Uploads the file to the requesting Slack channel using Slack's
      current 3-step external upload flow (files.upload is deprecated).
+
+Required environment variables (set these on Render):
+  SHOPIFY_STORE          e.g. "fragrantsouq.myshopify.com"
+  SHOPIFY_ADMIN_TOKEN    Shopify Admin API access token (read_orders scope)
+  SLACK_BOT_TOKEN        Bot token with files:write scope, bot invited to
+                          the channel this command will be run from
+  SLACK_SIGNING_SECRET   (optional but recommended) used to verify the
+                          request really came from Slack
+  AIRTABLE_API_KEY       Airtable personal access token, read access to
+                          the French Inventories table
+  AIRTABLE_BASE_ID       (optional) defaults to app5gOqDt9aZrW5bV
+  AIRTABLE_TABLE_NAME    (optional) defaults to "French Inventories"
+  AIRTABLE_SKU_FIELD     (optional) defaults to "SKU" — the field name in
+                          that table holding the SKU. Change this if your
+                          actual field is named differently.
+  AIRTABLE_COST_FIELD    (optional) defaults to "Cost"
+
+Slack app setup:
+  - Create slash command "/gpreport" (no spaces allowed in the command
+    name itself) with Request URL:
+      https://<your-render-service>.onrender.com/slack/gp-report
+    Usage Hint: [start date] to [end date] e.g. 20-01-2026 to 30-01-2026
+  - Bot token scopes needed: files:write, chat:write
+  - Invite the bot to whichever channel(s) will run the command
 """
+
 import hashlib
 import hmac
 import os
@@ -42,6 +72,12 @@ SHOPIFY_API_VERSION = "2026-04"
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")  # optional
 
+AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
+AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "app5gOqDt9aZrW5bV")
+AIRTABLE_TABLE_NAME = os.environ.get("AIRTABLE_TABLE_NAME", "French Inventories")
+AIRTABLE_SKU_FIELD = os.environ.get("AIRTABLE_SKU_FIELD", "SKU")
+AIRTABLE_COST_FIELD = os.environ.get("AIRTABLE_COST_FIELD", "Cost")
+
 TARGET_STATUSES = {"paid", "partially_paid", "pending"}
 
 COLUMNS = [
@@ -56,7 +92,20 @@ COLUMNS = [
     "Shipping",
     "Taxes",
     "Discount",
+    "Total",
+    "Item Cost",
+    "Total Cost",
 ]
+
+# Column letters for the formula columns above — used to build live Excel
+# formulas. Update these if you ever reorder COLUMNS.
+COL_PRICE = "G"
+COL_QTY = "H"
+COL_SHIPPING = "I"
+COL_DISCOUNT = "K"
+COL_TOTAL = "L"
+COL_ITEM_COST = "M"
+COL_TOTAL_COST = "N"
 
 DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")  # DD-MM-YYYY
 
@@ -69,10 +118,17 @@ def verify_slack_signature(req) -> bool:
         return True  # verification skipped if secret not configured
 
     timestamp = req.headers.get("X-Slack-Request-Timestamp", "")
-    if not timestamp or abs(time.time() - int(timestamp)) > 60 * 5:
+    if not timestamp:
+        print("[gpreport] Signature check failed: no timestamp header present.", flush=True)
         return False
 
-    sig_basestring = f"v0:{timestamp}:{req.get_data(as_text=True)}"
+    age = abs(time.time() - int(timestamp))
+    if age > 60 * 5:
+        print(f"[gpreport] Signature check failed: timestamp too old/skewed ({age:.0f}s).", flush=True)
+        return False
+
+    raw_body = req.get_data(as_text=True)
+    sig_basestring = f"v0:{timestamp}:{raw_body}"
     my_sig = (
         "v0="
         + hmac.new(
@@ -82,7 +138,19 @@ def verify_slack_signature(req) -> bool:
         ).hexdigest()
     )
     slack_sig = req.headers.get("X-Slack-Signature", "")
-    return hmac.compare_digest(my_sig, slack_sig)
+
+    if not hmac.compare_digest(my_sig, slack_sig):
+        # Don't log full signatures/secret — just enough to spot common issues
+        # (e.g. wrong secret entirely, empty body, mismatched timestamp).
+        print(
+            "[gpreport] Signature check failed: computed sig doesn't match Slack's. "
+            f"body_len={len(raw_body)} timestamp_age={age:.0f}s "
+            f"mine_prefix={my_sig[:10]} slack_prefix={slack_sig[:10]}",
+            flush=True,
+        )
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +199,68 @@ def fetch_orders(start_date: datetime, end_date: datetime) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Airtable — look up Item Cost per SKU from "French Inventories"
+# ---------------------------------------------------------------------------
+def fetch_costs_from_airtable(skus: set) -> dict:
+    """Given a set of SKUs, return {sku: cost} looked up from Airtable's
+    French Inventories table. Batches lookups (POST listRecords, which
+    avoids GET URL-length limits) so we don't do one request per SKU."""
+    skus = [s for s in skus if s]  # drop blanks
+    if not skus:
+        return {}
+
+    costs = {}
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}/listRecords"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    batch_size = 100
+    batches = [skus[i : i + batch_size] for i in range(0, len(skus), batch_size)]
+    print(f"[gpreport] Looking up cost for {len(skus)} unique SKUs in {len(batches)} Airtable batch(es)...", flush=True)
+
+    for batch_num, batch in enumerate(batches, start=1):
+        conditions = ",".join(f"{{{AIRTABLE_SKU_FIELD}}}='{sku}'" for sku in batch)
+        formula = f"OR({conditions})"
+
+        offset = None
+        while True:
+            body = {
+                "filterByFormula": formula,
+                "fields": [AIRTABLE_SKU_FIELD, AIRTABLE_COST_FIELD],
+                "pageSize": 100,
+            }
+            if offset:
+                body["offset"] = offset
+
+            resp = requests.post(url, headers=headers, json=body, timeout=30)
+            if resp.status_code != 200:
+                print(f"[gpreport] Airtable cost lookup batch {batch_num} FAILED: {resp.status_code} {resp.text}", flush=True)
+                break
+            data = resp.json()
+
+            for record in data.get("records", []):
+                fields = record.get("fields", {})
+                sku = fields.get(AIRTABLE_SKU_FIELD)
+                cost = fields.get(AIRTABLE_COST_FIELD)
+                if sku is not None and cost is not None:
+                    costs[sku] = cost
+
+            offset = data.get("offset")
+            if not offset:
+                break
+
+        print(f"[gpreport] Airtable batch {batch_num}/{len(batches)} done. {len(costs)} costs found so far.", flush=True)
+
+    missing = set(skus) - set(costs.keys())
+    if missing:
+        print(f"[gpreport] {len(missing)} SKU(s) had no Airtable cost match (left blank in report).", flush=True)
+
+    return costs
+
+
+# ---------------------------------------------------------------------------
 # Excel building
 # ---------------------------------------------------------------------------
 STATUS_LABELS = {
@@ -155,8 +285,12 @@ def build_excel(orders: list) -> BytesIO:
         cell.alignment = Alignment(horizontal="center")
     ws.freeze_panes = "A2"
 
+    # ---- Pass 1: collect qualifying line-item rows + the set of SKUs we'll
+    # need cost data for, without writing to the sheet yet.
     status_counts = {"paid": 0, "partially_paid": 0, "pending": 0}
-    row_idx = 2
+    pending_rows = []  # list of dicts, one per line item row
+    all_skus = set()
+
     for order in orders:
         financial_status = order.get("financial_status")
         if financial_status not in TARGET_STATUSES:
@@ -184,22 +318,67 @@ def build_excel(orders: list) -> BytesIO:
         discount_total = order.get("total_discounts", "0.00")
 
         for li in line_items:
-            values = [
-                name,
-                status_label,
-                created_at,
-                fulfilled_at,
-                li.get("name", ""),
-                li.get("sku", ""),
-                li.get("price", ""),
-                li.get("quantity", ""),
-                shipping_total,
-                taxes_total,
-                discount_total,
-            ]
-            for col_idx, value in enumerate(values, start=1):
-                ws.cell(row=row_idx, column=col_idx, value=value)
-            row_idx += 1
+            sku = li.get("sku", "")
+            if sku:
+                all_skus.add(sku)
+            pending_rows.append(
+                {
+                    "name": name,
+                    "status_label": status_label,
+                    "created_at": created_at,
+                    "fulfilled_at": fulfilled_at,
+                    "li_name": li.get("name", ""),
+                    "sku": sku,
+                    "price": li.get("price", ""),
+                    "qty": li.get("quantity", ""),
+                    "shipping": shipping_total,
+                    "taxes": taxes_total,
+                    "discount": discount_total,
+                }
+            )
+
+    # ---- Batch-fetch Item Cost per SKU from Airtable, once, for every SKU
+    # we'll need across the whole report.
+    cost_by_sku = fetch_costs_from_airtable(all_skus)
+
+    # ---- Pass 2: write rows, with Total / Total Cost as live Excel formulas
+    # and Item Cost as the looked-up value for that row's SKU.
+    row_idx = 2
+    for row in pending_rows:
+        values = [
+            row["name"],
+            row["status_label"],
+            row["created_at"],
+            row["fulfilled_at"],
+            row["li_name"],
+            row["sku"],
+            row["price"],
+            row["qty"],
+            row["shipping"],
+            row["taxes"],
+            row["discount"],
+        ]
+        for col_idx, value in enumerate(values, start=1):
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+        item_cost = cost_by_sku.get(row["sku"])  # None if no match found
+
+        # Total = (Lineitem price * quantity) + Shipping - Discount
+        ws.cell(
+            row=row_idx,
+            column=COLUMNS.index("Total") + 1,
+            value=f"={COL_PRICE}{row_idx}*{COL_QTY}{row_idx}+{COL_SHIPPING}{row_idx}-{COL_DISCOUNT}{row_idx}",
+        )
+        # Item Cost = looked up value (blank if SKU had no Airtable match)
+        ws.cell(row=row_idx, column=COLUMNS.index("Item Cost") + 1, value=item_cost)
+        # Total Cost = Item Cost * quantity
+        ws.cell(
+            row=row_idx,
+            column=COLUMNS.index("Total Cost") + 1,
+            value=f"={COL_ITEM_COST}{row_idx}*{COL_QTY}{row_idx}",
+        )
+
+        row_idx += 1
 
     for col_idx, col_name in enumerate(COLUMNS, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = max(14, len(col_name) + 6)
@@ -302,14 +481,14 @@ def process_report(channel_id: str, start_date, end_date, response_url: str):
 # ---------------------------------------------------------------------------
 @app.route("/slack/gp-report", methods=["POST"])
 def gp_report():
+    if not verify_slack_signature(request):
+        print("[gpreport] Rejected: invalid Slack signature.", flush=True)
+        return jsonify({"response_type": "ephemeral", "text": "Invalid request signature."}), 401
+
     text = request.form.get("text", "").strip()
     channel_id = request.form.get("channel_id")
     response_url = request.form.get("response_url")
     print(f"[gpreport] Received command: text='{text}' channel={channel_id}", flush=True)
-
-    if not verify_slack_signature(request):
-        print("[gpreport] Rejected: invalid Slack signature.", flush=True)
-        return jsonify({"response_type": "ephemeral", "text": "Invalid request signature."}), 401
 
     usage_error = jsonify(
         {
