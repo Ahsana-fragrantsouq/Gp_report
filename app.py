@@ -20,7 +20,9 @@ What it does:
      Lineitem sku, Lineitem price, Lineitem quantity, Shipping, Taxes,
      Discount, Total, Item Cost, Total Cost
      — where Total = (price * qty) + Shipping - Discount, and
-       Total Cost = Item Cost * qty, both as LIVE Excel formulas.
+       Total Cost = Item Cost * qty, both computed as plain values
+       (not Excel formulas, so they display correctly in any preview,
+       not just when opened in real Excel).
    - Uploads the file to the requesting Slack channel using Slack's
      current 3-step external upload flow (files.upload is deprecated).
 
@@ -96,16 +98,6 @@ COLUMNS = [
     "Item Cost",
     "Total Cost",
 ]
-
-# Column letters for the formula columns above — used to build live Excel
-# formulas. Update these if you ever reorder COLUMNS.
-COL_PRICE = "G"
-COL_QTY = "H"
-COL_SHIPPING = "I"
-COL_DISCOUNT = "K"
-COL_TOTAL = "L"
-COL_ITEM_COST = "M"
-COL_TOTAL_COST = "N"
 
 DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")  # DD-MM-YYYY
 
@@ -341,9 +333,14 @@ def build_excel(orders: list) -> BytesIO:
     # we'll need across the whole report.
     cost_by_sku = fetch_costs_from_airtable(all_skus)
 
-    # ---- Pass 2: write rows, with Total / Total Cost as live Excel formulas
-    # and Item Cost as the looked-up value for that row's SKU.
+    # ---- Pass 2: write rows. Total / Total Cost are computed as plain
+    # numbers in Python (not Excel formulas) — openpyxl doesn't calculate
+    # formula results itself, so viewers without a calc engine (Slack's
+    # inline preview, some other tools) show blank cells for formulas
+    # until the file is opened in real Excel. Plain values display
+    # correctly everywhere.
     row_idx = 2
+    rows_missing_cost = 0
     for row in pending_rows:
         values = [
             row["name"],
@@ -362,23 +359,33 @@ def build_excel(orders: list) -> BytesIO:
             ws.cell(row=row_idx, column=col_idx, value=value)
 
         item_cost = cost_by_sku.get(row["sku"])  # None if no match found
+        if item_cost is None:
+            rows_missing_cost += 1
 
-        # Total = (Lineitem price * quantity) + Shipping - Discount
-        ws.cell(
-            row=row_idx,
-            column=COLUMNS.index("Total") + 1,
-            value=f"={COL_PRICE}{row_idx}*{COL_QTY}{row_idx}+{COL_SHIPPING}{row_idx}-{COL_DISCOUNT}{row_idx}",
-        )
-        # Item Cost = looked up value (blank if SKU had no Airtable match)
+        try:
+            price = float(row["price"] or 0)
+            qty = float(row["qty"] or 0)
+            shipping = float(row["shipping"] or 0)
+            discount = float(row["discount"] or 0)
+            total = (price * qty) + shipping - discount
+        except (TypeError, ValueError) as e:
+            print(f"[gpreport] WARN row {row_idx} ({row['sku']}): couldn't compute Total — {e}", flush=True)
+            total = None
+
+        total_cost = None
+        if item_cost is not None:
+            try:
+                total_cost = float(item_cost) * qty
+            except (TypeError, ValueError) as e:
+                print(f"[gpreport] WARN row {row_idx} ({row['sku']}): couldn't compute Total Cost — {e}", flush=True)
+
+        ws.cell(row=row_idx, column=COLUMNS.index("Total") + 1, value=total)
         ws.cell(row=row_idx, column=COLUMNS.index("Item Cost") + 1, value=item_cost)
-        # Total Cost = Item Cost * quantity
-        ws.cell(
-            row=row_idx,
-            column=COLUMNS.index("Total Cost") + 1,
-            value=f"={COL_ITEM_COST}{row_idx}*{COL_QTY}{row_idx}",
-        )
+        ws.cell(row=row_idx, column=COLUMNS.index("Total Cost") + 1, value=total_cost)
 
         row_idx += 1
+
+    print(f"[gpreport] {rows_missing_cost} of {row_idx - 2} rows had no Airtable cost match.", flush=True)
 
     for col_idx, col_name in enumerate(COLUMNS, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = max(14, len(col_name) + 6)
