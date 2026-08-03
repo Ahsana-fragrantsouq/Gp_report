@@ -1,7 +1,7 @@
 """
-/Gp report Slack slash command
+/gpreport Slack slash command
 --------------------------------
-Usage in Slack:  /Gp report 2026-07-01 2026-07-31
+Usage in Slack:  /gpreport 20-01-2026 to 30-01-2026
 
 What it does:
 1. Slack POSTs the slash command to /slack/gp-report on this Flask app.
@@ -19,19 +19,6 @@ What it does:
    - Uploads the file to the requesting Slack channel using Slack's
      current 3-step external upload flow (files.upload is deprecated).
 
-Required environment variables (set these on Render):
-  SHOPIFY_STORE          e.g. "fragrantsouq.myshopify.com"
-  SHOPIFY_ADMIN_TOKEN    Shopify Admin API access token (read_orders scope)
-  SLACK_BOT_TOKEN        Bot token with files:write scope, bot invited to
-                          the channel this command will be run from
-  SLACK_SIGNING_SECRET   (optional but recommended) used to verify the
-                          request really came from Slack
-
-Slack app setup:
-  - Create/edit slash command "/Gp" (or reuse existing) with Request URL:
-      https://<your-render-service>.onrender.com/slack/gp-report
-  - Bot token scopes needed: files:write, chat:write
-  - Invite the bot to whichever channel(s) will run the command
 """
 
 import hashlib
@@ -72,7 +59,7 @@ COLUMNS = [
     "Discount",
 ]
 
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")  # DD-MM-YYYY
 
 
 # ---------------------------------------------------------------------------
@@ -102,15 +89,16 @@ def verify_slack_signature(req) -> bool:
 # ---------------------------------------------------------------------------
 # Shopify
 # ---------------------------------------------------------------------------
-def fetch_orders(start_date: str, end_date: str) -> list:
-    """Fetch all orders (any status) created within the date range, paginated."""
+def fetch_orders(start_date: datetime, end_date: datetime) -> list:
+    """Fetch all orders (any status) created within the date range, paginated.
+    start_date/end_date are datetime.date objects."""
     orders = []
     base_url = f"https://{SHOPIFY_STORE}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
     headers = {"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN}
     params = {
         "status": "any",
-        "created_at_min": f"{start_date}T00:00:00+04:00",
-        "created_at_max": f"{end_date}T23:59:59+04:00",
+        "created_at_min": f"{start_date.isoformat()}T00:00:00+04:00",
+        "created_at_max": f"{end_date.isoformat()}T23:59:59+04:00",
         "limit": 250,
     }
 
@@ -251,13 +239,16 @@ def upload_to_slack(channel_id: str, file_buf: BytesIO, filename: str, comment: 
 # ---------------------------------------------------------------------------
 # Background worker
 # ---------------------------------------------------------------------------
-def process_report(channel_id: str, start_date: str, end_date: str, response_url: str):
+def process_report(channel_id: str, start_date, end_date, response_url: str):
+    """start_date/end_date are datetime.date objects."""
     try:
         orders = fetch_orders(start_date, end_date)
         buf = build_excel(orders)
-        filename = f"GP_Report_{start_date}_to_{end_date}.xlsx"
+        start_str = start_date.strftime("%d-%m-%Y")
+        end_str = end_date.strftime("%d-%m-%Y")
+        filename = f"GP_Report_{start_str}_to_{end_str}.xlsx"
         comment = (
-            f"📊 GP Report — {start_date} to {end_date}\n"
+            f"📊 GP Report — {start_str} to {end_str}\n"
             f"(Paid, Partially Paid & Pending orders only)"
         )
         upload_to_slack(channel_id, buf, filename, comment)
@@ -284,27 +275,33 @@ def gp_report():
     channel_id = request.form.get("channel_id")
     response_url = request.form.get("response_url")
 
-    parts = text.split()
-    if parts and parts[0].lower() == "report":
-        parts = parts[1:]
+    usage_error = jsonify(
+        {
+            "response_type": "ephemeral",
+            "text": (
+                "⚠️ Usage: `/gpreport DD-MM-YYYY to DD-MM-YYYY`\n"
+                "Example: `/gpreport 20-01-2026 to 30-01-2026`"
+            ),
+        }
+    )
+
+    # Strip the word "to" (case-insensitive) wherever it appears, then we
+    # should be left with exactly two DD-MM-YYYY tokens.
+    parts = [p for p in text.split() if p.lower() != "to"]
 
     if len(parts) != 2 or not DATE_RE.match(parts[0]) or not DATE_RE.match(parts[1]):
-        return jsonify(
-            {
-                "response_type": "ephemeral",
-                "text": (
-                    "⚠️ Usage: `/Gp report YYYY-MM-DD YYYY-MM-DD`\n"
-                    "Example: `/Gp report 2026-07-01 2026-07-31`"
-                ),
-            }
-        )
+        return usage_error
 
-    start_date, end_date = parts
     try:
-        datetime.strptime(start_date, "%Y-%m-%d")
-        datetime.strptime(end_date, "%Y-%m-%d")
+        start_date = datetime.strptime(parts[0], "%d-%m-%Y").date()
+        end_date = datetime.strptime(parts[1], "%d-%m-%Y").date()
     except ValueError:
-        return jsonify({"response_type": "ephemeral", "text": "⚠️ Invalid date format. Use YYYY-MM-DD."})
+        return jsonify({"response_type": "ephemeral", "text": "⚠️ Invalid date. Use DD-MM-YYYY, e.g. 20-01-2026."})
+
+    if end_date < start_date:
+        return jsonify(
+            {"response_type": "ephemeral", "text": "⚠️ End date is before start date — check the order."}
+        )
 
     threading.Thread(
         target=process_report,
@@ -312,10 +309,12 @@ def gp_report():
         daemon=True,
     ).start()
 
+    start_str = start_date.strftime("%d-%m-%Y")
+    end_str = end_date.strftime("%d-%m-%Y")
     return jsonify(
         {
             "response_type": "ephemeral",
-            "text": f"⏳ Generating GP report for {start_date} → {end_date}... it'll post here shortly.",
+            "text": f"⏳ Generating GP report for {start_str} → {end_str}... it'll post here shortly.",
         }
     )
 
