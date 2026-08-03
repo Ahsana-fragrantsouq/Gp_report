@@ -18,9 +18,7 @@ What it does:
      Lineitem price, Lineitem quantity, Shipping, Taxes, Discount
    - Uploads the file to the requesting Slack channel using Slack's
      current 3-step external upload flow (files.upload is deprecated).
-
 """
-
 import hashlib
 import hmac
 import os
@@ -48,6 +46,7 @@ TARGET_STATUSES = {"paid", "partially_paid", "pending"}
 
 COLUMNS = [
     "Name",
+    "Payment Status",
     "Created at",
     "Fulfilled at",
     "Lineitem name",
@@ -103,7 +102,9 @@ def fetch_orders(start_date: datetime, end_date: datetime) -> list:
     }
 
     url = base_url
+    page_num = 1
     while url:
+        print(f"[gpreport] Fetching orders page {page_num}...", flush=True)
         resp = requests.get(
             url,
             headers=headers,
@@ -112,7 +113,9 @@ def fetch_orders(start_date: datetime, end_date: datetime) -> list:
         )
         resp.raise_for_status()
         data = resp.json()
-        orders.extend(data.get("orders", []))
+        page_orders = data.get("orders", [])
+        orders.extend(page_orders)
+        print(f"[gpreport] Page {page_num}: got {len(page_orders)} orders (total so far: {len(orders)})", flush=True)
 
         next_url = None
         link_header = resp.headers.get("Link", "")
@@ -121,13 +124,22 @@ def fetch_orders(start_date: datetime, end_date: datetime) -> list:
                 if 'rel="next"' in part:
                     next_url = part[part.find("<") + 1 : part.find(">")]
         url = next_url
+        page_num += 1
 
+    print(f"[gpreport] Done fetching. {len(orders)} total orders in range.", flush=True)
     return orders
 
 
 # ---------------------------------------------------------------------------
 # Excel building
 # ---------------------------------------------------------------------------
+STATUS_LABELS = {
+    "paid": "Paid",
+    "partially_paid": "Partially Paid",
+    "pending": "Pending",
+}
+
+
 def build_excel(orders: list) -> BytesIO:
     wb = Workbook()
     ws = wb.active
@@ -143,16 +155,20 @@ def build_excel(orders: list) -> BytesIO:
         cell.alignment = Alignment(horizontal="center")
     ws.freeze_panes = "A2"
 
+    status_counts = {"paid": 0, "partially_paid": 0, "pending": 0}
     row_idx = 2
     for order in orders:
-        if order.get("financial_status") not in TARGET_STATUSES:
+        financial_status = order.get("financial_status")
+        if financial_status not in TARGET_STATUSES:
             continue
+        status_counts[financial_status] += 1
 
         line_items = order.get("line_items", [])
         if not line_items:
             continue
 
         name = order.get("name", "")
+        status_label = STATUS_LABELS.get(financial_status, financial_status)
         created_at = order.get("created_at", "")
 
         fulfilled_at = ""
@@ -170,6 +186,7 @@ def build_excel(orders: list) -> BytesIO:
         for li in line_items:
             values = [
                 name,
+                status_label,
                 created_at,
                 fulfilled_at,
                 li.get("name", ""),
@@ -190,7 +207,13 @@ def build_excel(orders: list) -> BytesIO:
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
-    return buf
+    print(
+        f"[gpreport] Excel built: {row_idx - 2} line-item rows "
+        f"(Paid={status_counts['paid']}, Partially Paid={status_counts['partially_paid']}, "
+        f"Pending={status_counts['pending']})",
+        flush=True,
+    )
+    return buf, status_counts
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +222,7 @@ def build_excel(orders: list) -> BytesIO:
 # ---------------------------------------------------------------------------
 def upload_to_slack(channel_id: str, file_buf: BytesIO, filename: str, comment: str):
     file_bytes = file_buf.getvalue()
+    print(f"[gpreport] Uploading '{filename}' ({len(file_bytes)} bytes) to Slack channel {channel_id}...", flush=True)
 
     # Step 1: get an upload URL
     resp = requests.post(
@@ -209,13 +233,16 @@ def upload_to_slack(channel_id: str, file_buf: BytesIO, filename: str, comment: 
     )
     data = resp.json()
     if not data.get("ok"):
+        print(f"[gpreport] ERROR getUploadURLExternal: {data}", flush=True)
         raise RuntimeError(f"getUploadURLExternal failed: {data}")
     upload_url = data["upload_url"]
     file_id = data["file_id"]
+    print(f"[gpreport] Got upload URL, file_id={file_id}", flush=True)
 
     # Step 2: upload the raw bytes
     up_resp = requests.post(upload_url, files={"file": (filename, file_bytes)}, timeout=60)
     up_resp.raise_for_status()
+    print("[gpreport] File bytes uploaded to Slack.", flush=True)
 
     # Step 3: complete the upload and share it to the channel
     complete_resp = requests.post(
@@ -233,7 +260,9 @@ def upload_to_slack(channel_id: str, file_buf: BytesIO, filename: str, comment: 
     )
     complete_data = complete_resp.json()
     if not complete_data.get("ok"):
+        print(f"[gpreport] ERROR completeUploadExternal: {complete_data}", flush=True)
         raise RuntimeError(f"completeUploadExternal failed: {complete_data}")
+    print(f"[gpreport] Report posted successfully to {channel_id}.", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -241,18 +270,23 @@ def upload_to_slack(channel_id: str, file_buf: BytesIO, filename: str, comment: 
 # ---------------------------------------------------------------------------
 def process_report(channel_id: str, start_date, end_date, response_url: str):
     """start_date/end_date are datetime.date objects."""
+    start_str = start_date.strftime("%d-%m-%Y")
+    end_str = end_date.strftime("%d-%m-%Y")
+    print(f"[gpreport] Job started: {start_str} to {end_str} for channel {channel_id}", flush=True)
     try:
         orders = fetch_orders(start_date, end_date)
-        buf = build_excel(orders)
-        start_str = start_date.strftime("%d-%m-%Y")
-        end_str = end_date.strftime("%d-%m-%Y")
+        buf, status_counts = build_excel(orders)
         filename = f"GP_Report_{start_str}_to_{end_str}.xlsx"
         comment = (
             f"📊 GP Report — {start_str} to {end_str}\n"
-            f"(Paid, Partially Paid & Pending orders only)"
+            f"Paid: {status_counts['paid']} · "
+            f"Partially Paid: {status_counts['partially_paid']} · "
+            f"Pending: {status_counts['pending']}"
         )
         upload_to_slack(channel_id, buf, filename, comment)
+        print(f"[gpreport] Job finished successfully: {start_str} to {end_str}", flush=True)
     except Exception as e:  # noqa: BLE001
+        print(f"[gpreport] Job FAILED: {start_str} to {end_str} — {e}", flush=True)
         requests.post(
             response_url,
             json={
@@ -268,12 +302,14 @@ def process_report(channel_id: str, start_date, end_date, response_url: str):
 # ---------------------------------------------------------------------------
 @app.route("/slack/gp-report", methods=["POST"])
 def gp_report():
-    if not verify_slack_signature(request):
-        return jsonify({"response_type": "ephemeral", "text": "Invalid request signature."}), 401
-
     text = request.form.get("text", "").strip()
     channel_id = request.form.get("channel_id")
     response_url = request.form.get("response_url")
+    print(f"[gpreport] Received command: text='{text}' channel={channel_id}", flush=True)
+
+    if not verify_slack_signature(request):
+        print("[gpreport] Rejected: invalid Slack signature.", flush=True)
+        return jsonify({"response_type": "ephemeral", "text": "Invalid request signature."}), 401
 
     usage_error = jsonify(
         {
@@ -290,15 +326,18 @@ def gp_report():
     parts = [p for p in text.split() if p.lower() != "to"]
 
     if len(parts) != 2 or not DATE_RE.match(parts[0]) or not DATE_RE.match(parts[1]):
+        print(f"[gpreport] Rejected: bad usage, parts={parts}", flush=True)
         return usage_error
 
     try:
         start_date = datetime.strptime(parts[0], "%d-%m-%Y").date()
         end_date = datetime.strptime(parts[1], "%d-%m-%Y").date()
     except ValueError:
+        print(f"[gpreport] Rejected: invalid date format, parts={parts}", flush=True)
         return jsonify({"response_type": "ephemeral", "text": "⚠️ Invalid date. Use DD-MM-YYYY, e.g. 20-01-2026."})
 
     if end_date < start_date:
+        print(f"[gpreport] Rejected: end date before start date ({parts})", flush=True)
         return jsonify(
             {"response_type": "ephemeral", "text": "⚠️ End date is before start date — check the order."}
         )
