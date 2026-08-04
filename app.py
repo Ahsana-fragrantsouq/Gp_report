@@ -146,6 +146,9 @@ ARAMEX_PROVINCE_NAME_RATES = [
 # Professional Courier is a flat rate, unlike Aramex's emirate-based rates.
 PROFESSIONAL_COURIER_RATE = 31.50
 
+# Porter is a flat rate, used for Dubai deliveries.
+PORTER_RATE = 45.00
+
 
 
 # Payment gateway fee as a fraction of Total. Matched against Shopify's
@@ -554,6 +557,12 @@ def build_excel(orders: list) -> BytesIO:
                     f"code='{row['dest_province_code']}' -> {carrier_shipping} AED",
                     flush=True,
                 )
+        elif "porter" in carrier_text:
+            carrier_shipping = PORTER_RATE
+            print(
+                f"[gpreport] Matched {row['name']}: Porter -> {PORTER_RATE} AED",
+                flush=True,
+            )
         elif "professional" in carrier_text or (row["tracking_company"] or "").strip().lower() == "other":
             carrier_shipping = PROFESSIONAL_COURIER_RATE
             print(
