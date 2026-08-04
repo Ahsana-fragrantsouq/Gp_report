@@ -71,6 +71,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from io import BytesIO
 
@@ -134,10 +135,13 @@ ARAMEX_RATES = [
 # Professional Courier is a flat rate, unlike Aramex's city-based rates.
 PROFESSIONAL_COURIER_RATE = 31.50
 
+
 # Payment gateway fee as a fraction of Total. Matched against Shopify's
-# payment_gateway_names (case-insensitive substring match).
+# payment_gateway_names (case-insensitive substring match). "manual" is
+# included under COD because Shopify records COD as a "manual" payment
+# gateway internally.
 GATEWAY_RATES = [
-    (("cod", "cash on delivery", "cash_on_delivery"), 0.0, "COD"),
+    (("cod", "cash on delivery", "cash_on_delivery", "manual"), 0.0, "COD"),
     (("tabby",), 0.095, "Tabby"),
     (("card", "shopify_payments", "stripe", "credit"), 0.032, "Card"),
 ]
@@ -145,9 +149,19 @@ GATEWAY_RATES = [
 DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")  # DD-MM-YYYY
 
 
+def normalize_text(text: str) -> str:
+    """Lowercase, strip accents (e.g. 'Dubaï' -> 'dubai'), and replace
+    hyphens/underscores with spaces (e.g. 'Abu-dhabi' -> 'abu dhabi')."""
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = text.replace("-", " ").replace("_", " ")
+    return text.strip().lower()
+
+
 def match_aramex_rate(city: str):
     """Return the Aramex shipping charge for a city, or None if unrecognized."""
-    normalized = (city or "").strip().lower()
+    normalized = normalize_text(city)
     for keywords, rate in ARAMEX_RATES:
         if any(kw in normalized for kw in keywords):
             return rate
@@ -157,11 +171,12 @@ def match_aramex_rate(city: str):
 def match_gateway_rate(gateway_names: list):
     """Return (rate, label) for a list of Shopify payment_gateway_names,
     or (None, None) if none of the known patterns match."""
-    combined = " ".join(gateway_names or []).lower()
+    combined = normalize_text(" ".join(gateway_names or []))
     for keywords, rate, label in GATEWAY_RATES:
         if any(kw in combined for kw in keywords):
             return rate, label
     return None, None
+
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +393,12 @@ def build_excel(orders: list) -> BytesIO:
                 break
 
         dest_city = (order.get("shipping_address") or {}).get("city", "")
-        gateway_names = order.get("payment_gateway_names", [])
+        gateway_names = order.get("payment_gateway_names") or []
+        if not gateway_names and order.get("gateway"):
+            # Fallback: some orders (esp. older or certain checkout flows)
+            # only populate the older singular "gateway" field instead of
+            # payment_gateway_names.
+            gateway_names = [order["gateway"]]
 
         for li in line_items:
             sku = li.get("sku", "")
