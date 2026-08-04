@@ -18,11 +18,25 @@ What it does:
    - Builds a styled .xlsx with columns:
      Name, Payment Status, Created at, Fulfilled at, Lineitem name,
      Lineitem sku, Lineitem price, Lineitem quantity, Shipping, Taxes,
-     Discount, Total, Item Cost, Total Cost
-     — where Total = (price * qty) + Shipping - Discount, and
-       Total Cost = Item Cost * qty, both computed as plain values
-       (not Excel formulas, so they display correctly in any preview,
-       not just when opened in real Excel).
+     Discount, Total, Item Cost, Total Cost, Shipping (Aramex),
+     Gateway, Net Cost, GP, GP%
+     — where:
+       Total       = (price * qty) + Shipping - Discount
+       Total Cost  = Item Cost * qty
+       Shipping (Carrier) = Aramex: city-based rate (Dubai 18.67,
+                     Sharjah 20, Ajman 21, Abu Dhabi/Fujairah/
+                     Ras Al Khaimah/Umm Al Quwain 22.67). Professional
+                     Courier: flat 31.5. Matched against
+                     fulfillments[].tracking_company.
+       Gateway     = Total * gateway fee (COD 0%, Tabby 9.5%, Card 3.2%),
+                     matched against payment_gateway_names
+       Net Cost    = Item Cost + Shipping (Aramex) + Gateway
+       GP          = Total - Net Cost
+       GP%         = (GP / Total) * 100
+     All computed as plain values (not Excel formulas), so they display
+     correctly in any preview, not just when opened in real Excel.
+     Unrecognized cities/gateways are logged as warnings rather than
+     silently guessed.
    - Uploads the file to the requesting Slack channel using Slack's
      current 3-step external upload flow (files.upload is deprecated).
 
@@ -97,9 +111,57 @@ COLUMNS = [
     "Total",
     "Item Cost",
     "Total Cost",
+    "Shipping",       # Carrier shipping charge (Aramex: city-based, Professional
+                       # Courier: flat rate) — distinct from the order-level
+                       # "Shipping" column above; kept as a second "Shipping"
+                       # column to match your template
+    "Gateway",
+    "Net Cost",
+    "GP",
+    "GP%",
+]
+
+# Aramex charge by destination city (AED). Only applied when the order's
+# tracking company is Aramex — city text is normalized (lowercased) before
+# matching, so spelling variants like "Sharja"/"Sharjah" both work.
+ARAMEX_RATES = [
+    (("dubai",), 18.67),
+    (("sharj",), 20.00),  # matches "sharjah" and "sharja"
+    (("ajman",), 21.00),
+    (("abu dhabi", "fujair", "ras al khaim", "umm al quwain", "ummal quin"), 22.67),
+]
+
+# Professional Courier is a flat rate, unlike Aramex's city-based rates.
+PROFESSIONAL_COURIER_RATE = 31.50
+
+# Payment gateway fee as a fraction of Total. Matched against Shopify's
+# payment_gateway_names (case-insensitive substring match).
+GATEWAY_RATES = [
+    (("cod", "cash on delivery", "cash_on_delivery"), 0.0, "COD"),
+    (("tabby",), 0.095, "Tabby"),
+    (("card", "shopify_payments", "stripe", "credit"), 0.032, "Card"),
 ]
 
 DATE_RE = re.compile(r"^\d{2}-\d{2}-\d{4}$")  # DD-MM-YYYY
+
+
+def match_aramex_rate(city: str):
+    """Return the Aramex shipping charge for a city, or None if unrecognized."""
+    normalized = (city or "").strip().lower()
+    for keywords, rate in ARAMEX_RATES:
+        if any(kw in normalized for kw in keywords):
+            return rate
+    return None
+
+
+def match_gateway_rate(gateway_names: list):
+    """Return (rate, label) for a list of Shopify payment_gateway_names,
+    or (None, None) if none of the known patterns match."""
+    combined = " ".join(gateway_names or []).lower()
+    for keywords, rate, label in GATEWAY_RATES:
+        if any(kw in combined for kw in keywords):
+            return rate, label
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +371,15 @@ def build_excel(orders: list) -> BytesIO:
         taxes_total = order.get("total_tax", "0.00")
         discount_total = order.get("total_discounts", "0.00")
 
+        tracking_company = ""
+        for fulfillment in order.get("fulfillments", []):
+            if fulfillment.get("tracking_company"):
+                tracking_company = fulfillment["tracking_company"]
+                break
+
+        dest_city = (order.get("shipping_address") or {}).get("city", "")
+        gateway_names = order.get("payment_gateway_names", [])
+
         for li in line_items:
             sku = li.get("sku", "")
             if sku:
@@ -326,21 +397,33 @@ def build_excel(orders: list) -> BytesIO:
                     "shipping": shipping_total,
                     "taxes": taxes_total,
                     "discount": discount_total,
+                    "tracking_company": tracking_company,
+                    "dest_city": dest_city,
+                    "gateway_names": gateway_names,
                 }
             )
+
 
     # ---- Batch-fetch Item Cost per SKU from Airtable, once, for every SKU
     # we'll need across the whole report.
     cost_by_sku = fetch_costs_from_airtable(all_skus)
 
-    # ---- Pass 2: write rows. Total / Total Cost are computed as plain
-    # numbers in Python (not Excel formulas) — openpyxl doesn't calculate
-    # formula results itself, so viewers without a calc engine (Slack's
-    # inline preview, some other tools) show blank cells for formulas
-    # until the file is opened in real Excel. Plain values display
-    # correctly everywhere.
+    # The "Shipping" header appears twice (order-level Shopify shipping,
+    # and the Aramex carrier charge) — resolve the second one's column
+    # index explicitly rather than relying on COLUMNS.index(), which would
+    # only find the first match.
+    aramex_shipping_col = [i for i, c in enumerate(COLUMNS) if c == "Shipping"][-1] + 1
+
+    # ---- Pass 2: write rows. All computed columns are plain numbers in
+    # Python (not Excel formulas) — openpyxl doesn't calculate formula
+    # results itself, so viewers without a calc engine (Slack's inline
+    # preview, some other tools) show blank cells for formulas until the
+    # file is opened in real Excel. Plain values display correctly
+    # everywhere.
     row_idx = 2
     rows_missing_cost = 0
+    rows_unmapped_aramex_city = 0
+    rows_unmapped_gateway = 0
     for row in pending_rows:
         values = [
             row["name"],
@@ -371,6 +454,7 @@ def build_excel(orders: list) -> BytesIO:
         except (TypeError, ValueError) as e:
             print(f"[gpreport] WARN row {row_idx} ({row['sku']}): couldn't compute Total — {e}", flush=True)
             total = None
+            qty = 0
 
         total_cost = None
         if item_cost is not None:
@@ -379,13 +463,67 @@ def build_excel(orders: list) -> BytesIO:
             except (TypeError, ValueError) as e:
                 print(f"[gpreport] WARN row {row_idx} ({row['sku']}): couldn't compute Total Cost — {e}", flush=True)
 
+        # Carrier shipping charge: Aramex is city-based, Professional
+        # Courier is a flat rate. Any other/unrecognized carrier is left
+        # blank.
+        tracking_company_lower = (row["tracking_company"] or "").lower()
+        carrier_shipping = None
+        if "aramex" in tracking_company_lower:
+            carrier_shipping = match_aramex_rate(row["dest_city"])
+            if carrier_shipping is None:
+                rows_unmapped_aramex_city += 1
+                print(
+                    f"[gpreport] WARN row {row_idx} ({row['name']}): Aramex order with "
+                    f"unrecognized city '{row['dest_city']}' — shipping charge left blank.",
+                    flush=True,
+                )
+        elif "professional" in tracking_company_lower:
+            carrier_shipping = PROFESSIONAL_COURIER_RATE
+
+        # Payment gateway fee, as a percentage of Total
+        gateway_rate, gateway_label = match_gateway_rate(row["gateway_names"])
+        gateway_charge = None
+        if gateway_rate is not None and total is not None:
+            gateway_charge = round(total * gateway_rate, 2)
+        elif gateway_rate is None:
+            rows_unmapped_gateway += 1
+            print(
+                f"[gpreport] WARN row {row_idx} ({row['name']}): unrecognized payment gateway "
+                f"{row['gateway_names']} — gateway charge left blank.",
+                flush=True,
+            )
+
+        # Net Cost / GP / GP% only make sense once we have an Item Cost;
+        # missing shipping/gateway values are treated as 0 in the sum
+        # (they're already flagged above via the warnings) so one unknown
+        # component doesn't blank out the whole row.
+        net_cost = None
+        gp = None
+        gp_percent = None
+        if item_cost is not None:
+            net_cost = float(item_cost) + (carrier_shipping or 0) + (gateway_charge or 0)
+            if total is not None:
+                gp = total - net_cost
+                if total != 0:
+                    gp_percent = round((gp / total) * 100, 2)
+
         ws.cell(row=row_idx, column=COLUMNS.index("Total") + 1, value=total)
         ws.cell(row=row_idx, column=COLUMNS.index("Item Cost") + 1, value=item_cost)
         ws.cell(row=row_idx, column=COLUMNS.index("Total Cost") + 1, value=total_cost)
+        ws.cell(row=row_idx, column=aramex_shipping_col, value=carrier_shipping)
+        ws.cell(row=row_idx, column=COLUMNS.index("Gateway") + 1, value=gateway_charge)
+        ws.cell(row=row_idx, column=COLUMNS.index("Net Cost") + 1, value=net_cost)
+        ws.cell(row=row_idx, column=COLUMNS.index("GP") + 1, value=gp)
+        ws.cell(row=row_idx, column=COLUMNS.index("GP%") + 1, value=gp_percent)
 
         row_idx += 1
 
-    print(f"[gpreport] {rows_missing_cost} of {row_idx - 2} rows had no Airtable cost match.", flush=True)
+    print(
+        f"[gpreport] {rows_missing_cost} of {row_idx - 2} rows had no Airtable cost match. "
+        f"{rows_unmapped_aramex_city} Aramex rows had an unrecognized city. "
+        f"{rows_unmapped_gateway} rows had an unrecognized payment gateway.",
+        flush=True,
+    )
 
     for col_idx, col_name in enumerate(COLUMNS, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = max(14, len(col_name) + 6)
