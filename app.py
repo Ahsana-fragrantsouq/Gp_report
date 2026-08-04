@@ -135,6 +135,27 @@ ARAMEX_RATES = [
 # Professional Courier is a flat rate, unlike Aramex's city-based rates.
 PROFESSIONAL_COURIER_RATE = 31.50
 
+# Your checkout appears to append an emirate abbreviation as the last word
+# of the city field (e.g. "Barsha Heights Tecom DU", "Downtown DU" — both
+# Dubai). Matched as an exact match on the LAST token of the normalized
+# city string, so short abbreviations like "du" don't false-positive match
+# inside longer words.
+ARAMEX_CITY_ABBREVIATIONS = {
+    "du": 18.67,       # Dubai
+    "dubai": 18.67,
+    "shj": 20.00,      # Sharjah
+    "sharjah": 20.00,
+    "sharja": 20.00,
+    "ajm": 21.00,      # Ajman
+    "ajman": 21.00,
+    "auh": 22.67,      # Abu Dhabi
+    "ad": 22.67,
+    "fuj": 22.67,      # Fujairah
+    "fujairah": 22.67,
+    "rak": 22.67,      # Ras Al Khaimah
+    "uaq": 22.67,      # Umm Al Quwain
+}
+
 
 # Payment gateway fee as a fraction of Total. Matched against Shopify's
 # payment_gateway_names (case-insensitive substring match). "manual" is
@@ -162,6 +183,16 @@ def normalize_text(text: str) -> str:
 def match_aramex_rate(city: str):
     """Return the Aramex shipping charge for a city, or None if unrecognized."""
     normalized = normalize_text(city)
+    if not normalized:
+        return None
+
+    # First: exact match on the last token (handles "Barsha Heights Tecom DU").
+    last_token = normalized.split()[-1]
+    if last_token in ARAMEX_CITY_ABBREVIATIONS:
+        return ARAMEX_CITY_ABBREVIATIONS[last_token]
+
+    # Fallback: full-word/substring match anywhere in the city (handles
+    # cities that spell the emirate out in full).
     for keywords, rate in ARAMEX_RATES:
         if any(kw in normalized for kw in keywords):
             return rate
@@ -387,10 +418,28 @@ def build_excel(orders: list) -> BytesIO:
         discount_total = order.get("total_discounts", "0.00")
 
         tracking_company = ""
+        tracking_urls_combined = ""
         for fulfillment in order.get("fulfillments", []):
             if fulfillment.get("tracking_company"):
                 tracking_company = fulfillment["tracking_company"]
+            urls = fulfillment.get("tracking_urls") or (
+                [fulfillment["tracking_url"]] if fulfillment.get("tracking_url") else []
+            )
+            if urls:
+                tracking_urls_combined = " ".join(urls)
+            if tracking_company or tracking_urls_combined:
                 break
+
+        # Diagnostic: log the raw carrier data Shopify actually returned for
+        # this order, so we can tell whether "Aramex" shows up as literal
+        # text in tracking_company vs. only being inferred by Shopify's own
+        # UI from the tracking number/URL pattern.
+        if order.get("fulfillments"):
+            print(
+                f"[gpreport] Carrier check {order.get('name')}: "
+                f"tracking_company={tracking_company!r} tracking_url={tracking_urls_combined!r}",
+                flush=True,
+            )
 
         dest_city = (order.get("shipping_address") or {}).get("city", "")
         gateway_names = order.get("payment_gateway_names") or []
@@ -418,6 +467,7 @@ def build_excel(orders: list) -> BytesIO:
                     "taxes": taxes_total,
                     "discount": discount_total,
                     "tracking_company": tracking_company,
+                    "tracking_url": tracking_urls_combined,
                     "dest_city": dest_city,
                     "gateway_names": gateway_names,
                 }
@@ -485,10 +535,13 @@ def build_excel(orders: list) -> BytesIO:
 
         # Carrier shipping charge: Aramex is city-based, Professional
         # Courier is a flat rate. Any other/unrecognized carrier is left
-        # blank.
-        tracking_company_lower = (row["tracking_company"] or "").lower()
+        # blank. Checking both tracking_company AND tracking_url because
+        # Shopify sometimes shows "Aramex tracking" in the admin UI purely
+        # from auto-detecting the tracking number/URL pattern, without the
+        # tracking_company field itself literally saying "Aramex".
+        carrier_text = f"{row['tracking_company'] or ''} {row['tracking_url'] or ''}".lower()
         carrier_shipping = None
-        if "aramex" in tracking_company_lower:
+        if "aramex" in carrier_text:
             carrier_shipping = match_aramex_rate(row["dest_city"])
             if carrier_shipping is None:
                 rows_unmapped_aramex_city += 1
@@ -497,7 +550,12 @@ def build_excel(orders: list) -> BytesIO:
                     f"unrecognized city '{row['dest_city']}' — shipping charge left blank.",
                     flush=True,
                 )
-        elif "professional" in tracking_company_lower:
+            else:
+                print(
+                    f"[gpreport] Matched {row['name']}: Aramex, city='{row['dest_city']}' -> {carrier_shipping} AED",
+                    flush=True,
+                )
+        elif "professional" in carrier_text:
             carrier_shipping = PROFESSIONAL_COURIER_RATE
 
         # Payment gateway fee, as a percentage of Total
