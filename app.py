@@ -407,7 +407,14 @@ def build_excel(orders: list) -> BytesIO:
             float(s.get("price", 0) or 0) for s in order.get("shipping_lines", [])
         )
         taxes_total = order.get("total_tax", "0.00")
-        discount_total = order.get("total_discounts", "0.00")
+        discount_total = float(order.get("total_discounts", 0) or 0)
+
+        # Shipping and Discount are order-level totals, not per line item.
+        # Allocate each proportionally to a row's share of the order's
+        # TOTAL QUANTITY (not per-row-count), so a line item with qty=2
+        # gets twice the share of one with qty=1, and the rows still sum
+        # back to the order's actual shipping/discount total.
+        order_total_qty = sum(float(li.get("quantity") or 0) for li in line_items)
 
         tracking_company = ""
         tracking_urls_combined = ""
@@ -448,6 +455,12 @@ def build_excel(orders: list) -> BytesIO:
             sku = li.get("sku", "")
             if sku:
                 all_skus.add(sku)
+
+            li_qty = float(li.get("quantity") or 0)
+            qty_share = (li_qty / order_total_qty) if order_total_qty > 0 else 0
+            shipping_share = round(shipping_total * qty_share, 2)
+            discount_share = round(discount_total * qty_share, 2)
+
             pending_rows.append(
                 {
                     "name": name,
@@ -458,9 +471,9 @@ def build_excel(orders: list) -> BytesIO:
                     "sku": sku,
                     "price": li.get("price", ""),
                     "qty": li.get("quantity", ""),
-                    "shipping": shipping_total,
+                    "shipping": shipping_share,
                     "taxes": taxes_total,
-                    "discount": discount_total,
+                    "discount": discount_share,
                     "tracking_company": tracking_company,
                     "tracking_url": tracking_urls_combined,
                     "dest_city": dest_city,
@@ -635,7 +648,41 @@ def build_excel(orders: list) -> BytesIO:
 # Slack upload (current 3-step external upload flow; files.upload is
 # deprecated by Slack as of March 2025)
 # ---------------------------------------------------------------------------
+def ensure_bot_in_channel(channel_id: str):
+    """files.completeUploadExternal requires bot membership in the target
+    channel — chat:write.public does NOT extend to file sharing, per
+    Slack's docs. Auto-join public channels so /gpreport works without a
+    manual /invite everywhere it can. Private channels can't be
+    auto-joined by any bot (Slack platform limitation) — those still need
+    a manual invite; we just log that case clearly rather than failing
+    silently later at the upload step."""
+    resp = requests.post(
+        "https://slack.com/api/conversations.join",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        data={"channel": channel_id},
+        timeout=15,
+    )
+    data = resp.json()
+    if data.get("ok"):
+        if data.get("warning") == "already_in_channel":
+            print(f"[gpreport] Already a member of channel {channel_id}.", flush=True)
+        else:
+            print(f"[gpreport] Auto-joined channel {channel_id}.", flush=True)
+    else:
+        error = data.get("error", "unknown_error")
+        if error == "method_not_supported_for_channel_type":
+            print(
+                f"[gpreport] Channel {channel_id} is private/DM — can't auto-join. "
+                f"Bot must be manually /invite'd to this channel.",
+                flush=True,
+            )
+        else:
+            print(f"[gpreport] conversations.join for {channel_id} returned: {error}", flush=True)
+
+
 def upload_to_slack(channel_id: str, file_buf: BytesIO, filename: str, comment: str):
+    ensure_bot_in_channel(channel_id)
+
     file_bytes = file_buf.getvalue()
     print(f"[gpreport] Uploading '{filename}' ({len(file_bytes)} bytes) to Slack channel {channel_id}...", flush=True)
 
@@ -676,6 +723,11 @@ def upload_to_slack(channel_id: str, file_buf: BytesIO, filename: str, comment: 
     complete_data = complete_resp.json()
     if not complete_data.get("ok"):
         print(f"[gpreport] ERROR completeUploadExternal: {complete_data}", flush=True)
+        if complete_data.get("error") == "channel_not_found":
+            raise RuntimeError(
+                "I'm not in this channel and can't auto-join it (likely private). "
+                "Please /invite the bot to this channel and try again."
+            )
         raise RuntimeError(f"completeUploadExternal failed: {complete_data}")
     print(f"[gpreport] Report posted successfully to {channel_id}.", flush=True)
 
